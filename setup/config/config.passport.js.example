@@ -1,0 +1,403 @@
+const passport = require('passport');
+const JwtStrategy = require('passport-jwt').Strategy;
+const ExtractJwt = require('passport-jwt').ExtractJwt; // Not used
+const InstagramStrategy = require('passport-instagram').Strategy;
+// const LocalStrategy = require('passport-local').Strategy; // Not used
+const FacebookStrategy = require(__dirname+'/../src/passportStrategies/passport-facebook').Strategy;
+// const TwitterStrategy = require('passport-twitter').Strategy;
+const TwitterStrategy = require(__dirname+'/../src/passportStrategies/passport-twitter').Strategy;
+const GitHubStrategy = require(__dirname+'/../src/passportStrategies/passport-github').Strategy;
+const GoogleStrategy = require(__dirname+'/../src/passportStrategies/passport-google-oauth').OAuth2Strategy;
+const LinkedInStrategy = require('passport-linkedin-oauth2').Strategy;
+// const OpenIDStrategy = require('passport-openid').Strategy;
+// const OAuthStrategy = require('passport-oauth').OAuthStrategy;
+// const OAuth2Strategy = require('passport-oauth').OAuth2Strategy;
+const jwt = require('jsonwebtoken');
+const dotenv = require('dotenv');
+const fse = require('fs-extra');
+const request = require('request');
+const to = require('await-to-js').to
+,EmailStrategy = require(__dirname+'/../src/passportStrategies/passport-email')
+, { Entropy, charset8 } = require('entropy-string')
+, entropy = new Entropy({ total: 1e6, risk: 1e9 })
+
+const {sequelize} = require(__dirname+'/../apps/csystem/models')
+const Familyfe = require(__dirname+'/../src/node-familyfe')(sequelize)
+,config = require(__dirname+'/config.system')
+
+
+if (fse.existsSync('.env'))
+  dotenv.load({ path: __dirname+'/../env' });
+else
+  dotenv.load({ path: __dirname+'/../env.example' });
+
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+
+passport.deserializeUser((id, done) => {
+  User.findById(id, (err, user) => {
+    done(err, user);
+  });
+});
+
+passport.generateToken = (user)=>  {  
+  let token = jwt.sign({id: user.id}, process.env.JWT_SECRET, {
+      expiresIn: 3600
+  });
+  return token
+}
+
+/**
+ * Sign in using Email Profile.
+ */
+passport.use( new EmailStrategy({ usernameField: 'email' }, async (email, password, done) => {
+
+  let [err, dontcare, care] = [];
+  let profile = {Email: email}
+
+  ;[err, care] = await to (Familyfe.EmailProfile.whichEmailProfile(profile))
+  if(err)return done(err)
+
+  let user = care
+  if(Object.keys(care).length === 0)return done({message: JSON.stringify({Email:"No such user"}), status:422});
+  let IsActive = user.IsActive
+  if(IsActive === false) {
+      entropy.use(charset8)
+      let Code = entropy.string().substring(0, 8);
+      let euid = care.emailuid
+      , Email = care.Email
+      , activationPath = config.get('/APPROOT') + '/csymapp/emailprofile/' + Code 
+      , redirect = ''
+      ;[err, care] = await to ( Familyfe.EmailProfile.emailActivation({Code,EmailprofileEmailuid:euid}, Email, activationPath))
+      return done({ message: {Email:`Please check your inbox/spam folder to activate this email first.`}, status:422});
+  }
+  [err, care] = await to(user.comparePass(password))
+  if(err) return done(err)
+  if(care === false) {
+    ;[err, care] =  await to (Familyfe.EmailProfile.whichPerson(user.PersonUid))
+    if(err) return done({ message: {password:'Wrong email or password.'} , emailid: user.emailuid})
+    let person = care
+    person = JSON.parse(JSON.stringify(person))
+  
+    return done({ message: {password:'Wrong email or password.'} , emailid: user.emailuid, uid: person.uid})
+  }
+
+  user = JSON.parse(JSON.stringify(user))
+  
+  ;[err, care] =  await to (Familyfe.EmailProfile.whichPerson(user.PersonUid))
+  if(err)return done(err)
+
+  let person = care
+  person = JSON.parse(JSON.stringify(person))
+  
+  let token = passport.generateToken({id:person.uid});
+  person.token = token
+  return done (null, {person, emailid:user.emailuid})
+
+}));
+
+
+passport.use( new JwtStrategy({
+    jwtFromRequest: 
+            function (req) {
+              if(!req.req.headers.authorization) return null
+              return req.req.headers.authorization.split(' ')[1] || null
+          },
+    secretOrKey:process.env.JWT_SECRET }, async (jwt_payload, done) => {
+  let person = {uid: jwt_payload.id}
+  ;[err, care] = await to (Familyfe.EmailProfile.whichPerson(person.uid))
+  if(err)return done(err)
+
+  let user = care
+  if(Object.keys(care).length === 0)return done({"message": "No such user", status:422});
+  let IsActive = user.IsActive
+  if(IsActive === false)
+      return done({ message: `Email ${email} not Active. Please activate.`, status:422});
+
+  user = JSON.parse(JSON.stringify(user))
+  delete user.Password
+  if (user) {
+    done(null, user);
+  } else {
+    done(null, false);
+  }
+}))
+
+/**
+ * Sign in with GitHub.
+ */
+
+passport.use(new GitHubStrategy({
+  clientID: process.env.GITHUB_ID,
+  clientSecret: process.env.GITHUB_SECRET,
+  callbackURL: config.get('/baseUrl')+config.get('/callbacks/github'),
+  passReqToCallback: true
+}, async (req, accessToken, refreshToken, profile, done) => {
+  let githubid = profile.id
+  
+  return done(null, profile);
+}));
+
+/**
+ * Sign in with Facebook.
+ */
+passport.use(new FacebookStrategy({
+  clientID: process.env.FACEBOOK_ID,
+  clientSecret: process.env.FACEBOOK_SECRET,
+  // callbackURL: '/csymapp/auth/facebook/callback',
+  callbackURL: config.get('/baseUrl')+config.get('/callbacks/facebook'),
+  profileFields: ['name', 'email', 'link', 'locale', 'timezone'],
+  passReqToCallback: true
+}, (req, accessToken, refreshToken, profile, done) => {
+  return done(null, profile);
+
+}));
+
+let __promisifiedPassportAuthentication = async (req) =>{
+      return new Promise((resolve, reject) => {
+          passport.authenticate('jwt', {session: false}, (err, user, info) => {
+            // console.log(info)
+            if(info) {
+              info.status = 422
+              return reject(info)
+            }
+            if(err)return reject(err)
+            if(user === false)return reject({"message": "No information given", status:422});
+            resolve(user)
+          })(req) 
+      })
+}
+
+
+/**
+ * Sign in with Twitter.
+ */
+passport.use(new TwitterStrategy({
+  consumerKey: process.env.TWITTER_KEY,
+  consumerSecret: process.env.TWITTER_SECRET,
+  callbackURL: config.get('/baseUrl')+config.get('/callbacks/twitter'),
+  userProfileURL: "https://api.twitter.com/1.1/account/verify_credentials.json?include_email=true",
+  passReqToCallback: true
+}, (req, accessToken, tokenSecret, profile, done) => {
+  return done(null, profile);
+}));
+
+
+/**
+ * Sign in with Google.
+ */
+passport.use(new GoogleStrategy({
+  clientID: process.env.GOOGLE_ID,
+  clientSecret: process.env.GOOGLE_SECRET,
+  callbackURL: config.get('/baseUrl')+config.get('/callbacks/google'),
+  passReqToCallback: true
+}, async (req, accessToken, refreshToken, profile, done) => {
+  let githubid = profile.id
+  
+  return done(null, profile);
+}));
+
+/**
+ * Sign in with LinkedIn.
+ */
+// passport.use(new LinkedInStrategy({
+//   clientID: process.env.LINKEDIN_ID,
+//   clientSecret: process.env.LINKEDIN_SECRET,
+//   callbackURL: config.get('/baseUrl')+config.get('/callbacks/linkedin'),
+//   scope: ['r_basicprofile', 'r_emailaddress'],
+//   passReqToCallback: true
+// }, (req, accessToken, refreshToken, profile, done) => {
+//   return done(null, profile);
+// }));
+
+
+
+/*
+ * Borrowed from https://github.com/sahat/hackathon-starter and not yet implemented here.
+ */
+// /**
+//  * Sign in with Instagram.
+//  */
+// passport.use(new InstagramStrategy({
+//   clientID: process.env.INSTAGRAM_ID,
+//   clientSecret: process.env.INSTAGRAM_SECRET,
+//   callbackURL: '/auth/instagram/callback',
+//   passReqToCallback: true
+// }, (req, accessToken, refreshToken, profile, done) => {
+//   if (req.user) {
+//     User.findOne({ instagram: profile.id }, (err, existingUser) => {
+//       if (err) { return done(err); }
+//       if (existingUser) {
+//         req.flash('errors', { msg: 'There is already an Instagram account that belongs to you. Sign in with that account or delete it, then link it with your current account.' });
+//         done(err);
+//       } else {
+//         User.findById(req.user.id, (err, user) => {
+//           if (err) { return done(err); }
+//           user.instagram = profile.id;
+//           user.tokens.push({ kind: 'instagram', accessToken });
+//           user.profile.name = user.profile.name || profile.displayName;
+//           user.name.first = user.profile.name;
+//           user.profile.picture = user.profile.picture || profile._json.data.profile_picture;
+//           user.profile.website = user.profile.website || profile._json.data.website;
+//           user.save((err) => {
+//             req.flash('info', { msg: 'Instagram account has been linked.' });
+//             done(err, user);
+//           });
+//         });
+//       }
+//     });
+//   } else {
+//     User.findOne({ instagram: profile.id }, (err, existingUser) => {
+//       if (err) { return done(err); }
+//       if (existingUser) {
+//         req.flash('success', { msg: 'Welcome. You have successfully logged in' });
+//         return done(null, existingUser);
+//       }
+//       const user = new User();
+//       user.instagram = profile.id;
+//       user.tokens.push({ kind: 'instagram', accessToken });
+//       user.profile.name = profile.displayName;
+//       // Similar to Twitter API, assigns a temporary e-mail address
+//       // to get on with the registration process. It can be changed later
+//       // to a valid e-mail address in Profile Management.
+//       user.email = `${profile.username}@instagram.com`;
+//       user.profile.website = profile._json.data.website;
+//       user.profile.picture = profile._json.data.profile_picture;
+//       //user.save((err) => { done(err, user);});
+//           csyberUser.socialcreate(JSON.parse(JSON.stringify(user)), function(err, id){
+//               req.flash('info', { msg: 'Instagram account has been linked.' });
+//               User.findById(id, done);
+//           });
+//     });
+//   }
+// }));
+
+// /**
+//  * Tumblr API OAuth.
+//  */
+// passport.use('tumblr', new OAuthStrategy({
+//   requestTokenURL: 'http://www.tumblr.com/oauth/request_token',
+//   accessTokenURL: 'http://www.tumblr.com/oauth/access_token',
+//   userAuthorizationURL: 'http://www.tumblr.com/oauth/authorize',
+//   consumerKey: process.env.TUMBLR_KEY,
+//   consumerSecret: process.env.TUMBLR_SECRET,
+//   callbackURL: '/auth/tumblr/callback',
+//   passReqToCallback: true
+// },
+//   (req, token, tokenSecret, profile, done) => {
+//     User.findById(req.user._id, (err, user) => {
+//       if (err) { return done(err); }
+//       user.tokens.push({ kind: 'tumblr', accessToken: token, tokenSecret });
+//       user.save((err) => {
+//         done(err, user);
+//       });
+//     });
+//   }
+// ));
+
+// /**
+//  * Foursquare API OAuth.
+//  */
+// passport.use('foursquare', new OAuth2Strategy({
+//   authorizationURL: 'https://foursquare.com/oauth2/authorize',
+//   tokenURL: 'https://foursquare.com/oauth2/access_token',
+//   clientID: process.env.FOURSQUARE_ID,
+//   clientSecret: process.env.FOURSQUARE_SECRET,
+//   callbackURL: process.env.FOURSQUARE_REDIRECT_URL,
+//   passReqToCallback: true
+// },
+//   (req, accessToken, refreshToken, profile, done) => {
+//     User.findById(req.user._id, (err, user) => {
+//       if (err) { return done(err); }
+//       user.tokens.push({ kind: 'foursquare', accessToken });
+//       //user.save((err) => { done(err, user);});
+//           csyberUser.socialcreate(JSON.parse(JSON.stringify(user)), function(err, id){
+//               User.findById(id, done);
+//           });
+//     });
+//   }
+// ));
+
+// /**
+//  * Steam API OpenID.
+//  */
+// passport.use(new OpenIDStrategy({
+//   apiKey: process.env.STEAM_KEY,
+//   providerURL: 'http://steamcommunity.com/openid',
+//   returnURL: 'http://localhost:3000/auth/steam/callback',
+//   realm: 'http://localhost:3000/',
+//   stateless: true
+// }, (identifier, done) => {
+//   const steamId = identifier.match(/\d+$/)[0];
+//   const profileURL = `http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=${process.env.STEAM_KEY}&steamids=${steamId}`;
+
+//   User.findOne({ steam: steamId }, (err, existingUser) => {
+//     if (err) { return done(err); }
+//     if (existingUser) return done(err, existingUser);
+//     request(profileURL, (error, response, body) => {
+//       if (!error && response.statusCode === 200) {
+//         const data = JSON.parse(body);
+//         const profile = data.response.players[0];
+
+//         const user = new User();
+//         user.steam = steamId;
+//         user.email = `${steamId}@steam.com`; // steam does not disclose emails, prevent duplicate keys
+//         user.tokens.push({ kind: 'steam', accessToken: steamId });
+//         user.profile.name = profile.personaname;
+//         user.profile.picture = profile.avatarmedium;
+//         user.save((err) => {
+//           done(err, user);
+//         });
+//       } else {
+//         done(error, null);
+//       }
+//     });
+//   });
+// }));
+
+// /**
+//  * Pinterest API OAuth.
+//  */
+// passport.use('pinterest', new OAuth2Strategy({
+//   authorizationURL: 'https://api.pinterest.com/oauth/',
+//   tokenURL: 'https://api.pinterest.com/v1/oauth/token',
+//   clientID: process.env.PINTEREST_ID,
+//   clientSecret: process.env.PINTEREST_SECRET,
+//   callbackURL: process.env.PINTEREST_REDIRECT_URL,
+//   passReqToCallback: true
+// },
+//   (req, accessToken, refreshToken, profile, done) => {
+//     User.findById(req.user._id, (err, user) => {
+//       if (err) { return done(err); }
+//       user.tokens.push({ kind: 'pinterest', accessToken });
+//       //user.save((err) => { done(err, user);});
+//           csyberUser.socialcreate(JSON.parse(JSON.stringify(user)), function(err, id){
+//               User.findById(id, done);
+//           });
+//     });
+//   }
+// ));
+
+// /**
+//  * Login Required middleware.
+//  */
+// exports.isAuthenticated = (req, res, next) => {
+//   if (req.isAuthenticated()) {
+//     return next();
+//   }
+//   res.redirect('/login');
+// };
+
+// /**
+//  * Authorization Required middleware.
+//  */
+// exports.isAuthorized = (req, res, next) => {
+//   const provider = req.path.split('/').slice(-1)[0];
+//   const token = req.user.tokens.find(token => token.kind === provider);
+//   if (token) {
+//     next();
+//   } else {
+//     res.redirect(`/auth/${provider}`);
+//   }
+// };

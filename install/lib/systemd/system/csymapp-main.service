@@ -1,0 +1,15 @@
+[Unit]
+Description=csymapp-main
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/var/www/html/csymapp-main
+ExecStart=/var/www/html/csymapp-main/start.sh
+SyslogIdentifier=csymapp-main
+Restart=on-failure
+RestartSec=5
+
+
+[Install]
+WantedBy=multi-user.target
